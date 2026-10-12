@@ -49,6 +49,11 @@ button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px soli
 .go{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:0 16px;font-family:var(--display);font-weight:700;font-size:15px}
 .chips{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
 .chip{border:1px solid var(--line);background:var(--panel-2);border-radius:999px;padding:6px 12px;font-size:13px}
+.wakepill{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line);background:var(--panel-2);border-radius:999px;padding:6px 14px;font-size:13px;color:var(--muted)}
+.wakepill.on{border-color:var(--accent);color:var(--fg)}
+.wakedot{width:7px;height:7px;border-radius:50%;background:var(--line);flex:0 0 auto}
+.wakedot.on{background:var(--good);animation:wakepulse 1.6s ease-in-out infinite}
+@keyframes wakepulse{0%,100%{opacity:1}50%{opacity:.3}}
 
 .card{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:14px;display:flex;flex-direction:column;gap:10px}
 .card .eyebrow{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600;display:flex;justify-content:space-between;gap:8px}
@@ -110,7 +115,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px soli
 .finish{display:flex;flex-direction:column;gap:12px;align-items:center;width:100%}
 .finish input{width:120px;text-align:center;font-family:var(--display);font-size:32px;background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:12px;padding:8px}
 [hidden]{display:none!important}
-@media (prefers-reduced-motion: reduce){.bar i{transition:none}.timer{transition:none}.mic.listening{animation:none}}
+@media (prefers-reduced-motion: reduce){.bar i{transition:none}.timer{transition:none}.mic.listening{animation:none}.wakedot.on{animation:none}}
 </style>
 </head>
 <body>
@@ -125,6 +130,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px soli
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><path d="M12 17v5M8 22h8"/></svg>
     </button>
     <div class="hint" id="hint">Tap and talk</div>
+    <button class="wakepill" id="wakeBtn" aria-pressed="false"><span class="wakedot" id="wakeDot"></span><span id="wakeLabel">Say “Junior” to wake: off</span></button>
     <div class="heard" id="heard"></div>
     <div class="reply muted" id="reply">Say what you ate, what you did, or ask what to do today.</div>
     <div class="typerow"><input id="askBox" placeholder="…or type it"><button class="go" id="goBtn">Go</button></div>
@@ -165,6 +171,9 @@ button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px soli
       <span class="small">With a key, Junior uses Claude to understand speech, estimate calories and suggest meals. Without one it still logs and runs the timer, and suggests meals from a built-in list.</span>
     </label>
     <label>Voice replies <select id="ttsIn"><option value="1">On</option><option value="0">Off</option></select></label>
+    <label>Wake word ("Junior") <select id="wakeIn"><option value="0">Off</option><option value="1">On</option></select>
+      <span class="small">Listens for "Junior" while this app is open on screen. It stops if you lock the phone, switch apps, or close the tab — it can't wake the phone in the background the way Siri does. Uses more battery while on.</span>
+    </label>
     <label>Plan start date <input id="startIn" type="date"></label>
     <div class="row"><button id="sheetClose">Cancel</button><button class="primary" id="sheetSave">Save</button></div>
   </div>
@@ -218,7 +227,7 @@ const store={
   get(k,d){try{const v=localStorage.getItem("junior:"+k);return v?JSON.parse(v):d;}catch(e){return d;}},
   set(k,v){try{localStorage.setItem("junior:"+k,JSON.stringify(v));}catch(e){}}
 };
-let settings=store.get("settings",null); if(!settings){settings={startDate:todayKey(),tts:1,key:""};store.set("settings",settings);}
+let settings=store.get("settings",null); if(!settings){settings={startDate:todayKey(),tts:1,key:"",wake:0};store.set("settings",settings);}
 let days=store.get("days",{});
 function day(k){ k=k||todayKey(); if(!days[k]) days[k]={food:[],workouts:[]}; return days[k]; }
 function saveDays(){ store.set("days",days); renderAll(); }
@@ -260,23 +269,100 @@ $("logWoBtn").onclick=()=>{const c=planFor(todayKey());logWorkout(c==="R"?"Walk 
 
 // ---- speech ----
 const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-let rec=null,listening=false;
-if(!SR){$("hint").textContent="Voice isn't supported in this browser. Type below instead.";$("mic").style.opacity=.5;}
-$("mic").onclick=()=>{
+let rec=null,listening=false,ttsSpeaking=false;
+let passiveRec=null,passiveWanted=false,passiveRunning=false;
+if(!SR){$("hint").textContent="Voice isn't supported in this browser. Type below instead.";$("mic").style.opacity=.5;$("wakeBtn").hidden=true;}
+
+function setWakeUI(){
+  const on=!!settings.wake;
+  $("wakeBtn").setAttribute("aria-pressed",on?"true":"false");
+  $("wakeBtn").classList.toggle("on",on);
+  $("wakeDot").classList.toggle("on",on&&passiveRunning);
+  $("wakeLabel").textContent=on?"Listening for “Junior”":"Say “Junior” to wake: off";
+  if(!listening)$("hint").textContent=on?"Say “Junior”, or tap and talk":"Tap and talk";
+}
+function stopPassive(){
+  passiveWanted=false;
+  if(passiveRec){try{passiveRec.onend=null;passiveRec.onerror=null;passiveRec.onresult=null;passiveRec.stop();}catch(e){}}
+  passiveRec=null;passiveRunning=false;setWakeUI();
+}
+function startPassive(){
+  if(!SR||!settings.wake||listening||ttsSpeaking||document.visibilityState!=="visible"||passiveRunning)return;
+  passiveWanted=true;
+  let r2;try{r2=new SR();}catch(e){return;}
+  r2.lang="en-US";r2.continuous=true;r2.interimResults=true;r2.maxAlternatives=1;
+  let triggered=false;
+  r2.onstart=()=>{passiveRunning=true;setWakeUI();};
+  r2.onresult=e=>{
+    if(triggered)return;
+    for(let i=e.resultIndex;i<e.results.length;i++){
+      const t=e.results[i][0].transcript;
+      const m=t.match(/\bjunior\b[,.]?\s*(.*)/i);
+      if(m){
+        triggered=true;
+        const rest=m[1].trim();
+        try{navigator.vibrate&&navigator.vibrate(40);}catch(err){}
+        beep(1046,90);
+        try{r2.onend=null;r2.stop();}catch(err){}
+        passiveRunning=false;setWakeUI();
+        if(rest.length>2)handle(rest);else setTimeout(()=>startActive(),250);
+        break;
+      }
+    }
+  };
+  r2.onerror=e=>{
+    passiveRunning=false;
+    if(e.error==="not-allowed"||e.error==="service-not-allowed"){
+      settings.wake=0;store.set("settings",settings);setWakeUI();
+      say("I can't reach the microphone, so wake word is off. Allow microphone access and turn it back on in Settings.",true);
+    }
+  };
+  r2.onend=()=>{
+    passiveRunning=false;
+    if(passiveWanted&&settings.wake&&!listening&&!ttsSpeaking&&document.visibilityState==="visible")setTimeout(()=>{if(passiveWanted)startPassive();},300);
+    else setWakeUI();
+  };
+  passiveRec=r2;
+  try{r2.start();}catch(e){passiveRunning=false;}
+}
+function maybeResumePassive(){
+  if(settings.wake&&!listening&&!ttsSpeaking&&document.visibilityState==="visible")setTimeout(()=>{if(settings.wake&&!listening&&!ttsSpeaking)startPassive();},350);
+  else setWakeUI();
+}
+function startActive(){
   if(!SR)return;
-  if(listening){try{rec.stop();}catch(e){}return;}
+  stopPassive();
   try{window.speechSynthesis&&speechSynthesis.cancel();}catch(e){}
   rec=new SR();rec.lang="en-US";rec.interimResults=true;rec.maxAlternatives=1;
   let finalText="";
   rec.onstart=()=>{listening=true;$("mic").classList.add("listening");$("hint").textContent="Listening… tap to stop";$("heard").textContent="";};
   rec.onresult=e=>{let t="";for(let i=e.resultIndex;i<e.results.length;i++){t+=e.results[i][0].transcript;if(e.results[i].isFinal)finalText+=e.results[i][0].transcript;}$("heard").textContent=finalText||t;};
-  rec.onerror=e=>{listening=false;$("mic").classList.remove("listening");$("hint").textContent=e.error==="not-allowed"?"Microphone blocked. Allow it in your browser settings.":"Didn't catch that. Tap and try again.";};
-  rec.onend=()=>{listening=false;$("mic").classList.remove("listening");$("hint").textContent="Tap and talk";const q=(finalText||$("heard").textContent).trim();if(q)handle(q);};
+  rec.onerror=e=>{listening=false;$("mic").classList.remove("listening");$("hint").textContent=e.error==="not-allowed"?"Microphone blocked. Allow it in your browser settings.":"Didn't catch that. Tap and try again.";setWakeUI();};
+  rec.onend=()=>{listening=false;$("mic").classList.remove("listening");const q=(finalText||$("heard").textContent).trim();if(q)handle(q);else{setWakeUI();maybeResumePassive();}};
   try{rec.start();}catch(e){$("hint").textContent="Couldn't start the mic. Try again.";}
+}
+$("mic").onclick=()=>{if(!SR)return;if(listening){try{rec.stop();}catch(e){}return;}startActive();};
+$("wakeBtn").onclick=()=>{
+  if(!SR)return;
+  settings.wake=settings.wake?0:1;store.set("settings",settings);
+  if(settings.wake){say("Wake word on.",false);}else{stopPassive();say("Wake word off.",false);}
+  setWakeUI();
 };
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")maybeResumePassive();else stopPassive();});
+function speak(text){
+  if(!settings.tts||!window.speechSynthesis){maybeResumePassive();return;}
+  try{
+    speechSynthesis.cancel();
+    const u=new SpeechSynthesisUtterance(text.replace(/[✓•]/g,""));
+    u.rate=1.05;ttsSpeaking=true;
+    u.onend=()=>{ttsSpeaking=false;maybeResumePassive();};
+    u.onerror=()=>{ttsSpeaking=false;maybeResumePassive();};
+    speechSynthesis.speak(u);
+  }catch(e){ttsSpeaking=false;maybeResumePassive();}
+}
 function say(text,muted){
   const r=$("reply");r.textContent=text;r.classList.toggle("muted",!!muted);
-  if(settings.tts&&window.speechSynthesis&&!muted){try{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(text.replace(/[✓•]/g,""));u.rate=1.05;speechSynthesis.speak(u);}catch(e){}}
+  if(!muted)speak(text);else maybeResumePassive();
 }
 
 // ---- brain ----
@@ -337,9 +423,14 @@ $("askBox").addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault(
 document.querySelectorAll(".chip").forEach(c=>c.onclick=()=>handle(c.dataset.q));
 
 // ---- settings / export ----
-$("settingsBtn").onclick=()=>{$("keyIn").value=settings.key||"";$("ttsIn").value=settings.tts?"1":"0";$("startIn").value=settings.startDate;$("sheet").hidden=false;};
+$("settingsBtn").onclick=()=>{$("keyIn").value=settings.key||"";$("ttsIn").value=settings.tts?"1":"0";$("wakeIn").value=settings.wake?"1":"0";$("startIn").value=settings.startDate;$("sheet").hidden=false;};
 $("sheetClose").onclick=()=>$("sheet").hidden=true;
-$("sheetSave").onclick=()=>{settings={key:$("keyIn").value.trim(),tts:$("ttsIn").value==="1"?1:0,startDate:$("startIn").value||todayKey()};store.set("settings",settings);$("sheet").hidden=true;renderAll();};
+$("sheetSave").onclick=()=>{
+  settings={key:$("keyIn").value.trim(),tts:$("ttsIn").value==="1"?1:0,wake:$("wakeIn").value==="1"?1:0,startDate:$("startIn").value||todayKey()};
+  store.set("settings",settings);$("sheet").hidden=true;renderAll();
+  if(settings.wake)startPassive();else stopPassive();
+  setWakeUI();
+};
 $("exportBtn").onclick=()=>{const blob=new Blob([JSON.stringify({settings:{startDate:settings.startDate},days},null,2)],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="junior-log-"+todayKey()+".json";document.body.appendChild(a);a.click();a.remove();};
 
 // ---- timer ----
@@ -350,13 +441,13 @@ function buildSeq(){const code=planFor(todayKey()),p=PLANS[code],iv=interval(),s
   s.push({phase:"Finisher",name:p.finisher,secs:60,kind:"work"});
   COOL.forEach(e=>s.push({phase:"Cool-down",name:e,secs:25,kind:"rest"}));return s;}
 function beep(f,ms){try{actx=actx||new (window.AudioContext||window.webkitAudioContext)();const o=actx.createOscillator(),g=actx.createGain();o.frequency.value=f;o.connect(g);g.connect(actx.destination);g.gain.setValueAtTime(.2,actx.currentTime);g.gain.exponentialRampToValueAtTime(.001,actx.currentTime+ms/1000);o.start();o.stop(actx.currentTime+ms/1000);}catch(e){}}
-function announce(t){if(!settings.tts||!window.speechSynthesis)return;try{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(t);u.rate=1.1;speechSynthesis.speak(u);}catch(e){}}
+function announce(t){speak(t);}
 function mmss(s){s=Math.max(0,Math.round(s));return Math.floor(s/60)+":"+String(s%60).padStart(2,"0");}
 function showStep(){const st=seq[idx],T=$("timer");T.classList.toggle("work",st.kind==="work");T.classList.toggle("rest",st.kind==="rest");
   $("tPhase").textContent=st.phase;$("tEx").textContent=st.name;$("tClock").textContent=Math.ceil(remaining);
   const nx=seq[idx+1];$("tNext").textContent=nx?"Next: "+nx.name+" · "+nx.secs+"s":"Last one";
   const done=elapsedBefore+(st.secs-remaining);$("tLeft").textContent=mmss(total-done);$("tBar").style.width=(100*done/total)+"%";}
-function startTimer(){seq=buildSeq();idx=0;remaining=seq[0].secs;total=seq.reduce((a,b)=>a+b.secs,0);elapsedBefore=0;paused=false;
+function startTimer(){stopPassive();seq=buildSeq();idx=0;remaining=seq[0].secs;total=seq.reduce((a,b)=>a+b.secs,0);elapsedBefore=0;paused=false;
   const c=planFor(todayKey());$("tTitle").textContent="Workout "+c+" · "+PLANS[c].name;
   $("timer").hidden=false;$("tmain").hidden=false;$("finishBox").hidden=true;$("tctl").hidden=false;$("tPause").textContent="Pause";
   beep(880,120);announce("Warm-up. "+seq[0].name);showStep();runTick();
@@ -373,6 +464,8 @@ $("saveWo").onclick=()=>{const c=planFor(todayKey()),n=$("finishNum").value;logW
 
 // ---- boot ----
 renderAll();
+setWakeUI();
+if(SR&&settings.wake)setTimeout(startPassive,500);
 if(location.hash==="#listen"){setTimeout(()=>$("mic").click(),400);}
 if("serviceWorker" in navigator){navigator.serviceWorker.register("sw.js").catch(()=>{});}
 })();
